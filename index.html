@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
-<title>Chat LAN P2P — Multi-peer</title>
+<title>Chat P2P — Multi-peer</title>
 <style>
   * { box-sizing: border-box; }
   body { font-family: system-ui, sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; background: #f5f5f5; }
@@ -14,7 +14,7 @@
   button.primary { background: #4a90e2; color: #fff; border-color: #4a90e2; }
   button.primary:hover { background: #3a7bc8; }
   button.small { padding: 5px 10px; font-size: 12px; }
-  textarea { width: 100%; height: 70px; font-family: monospace; font-size: 11px; padding: 6px; border: 1px solid #ccc; border-radius: 5px; resize: vertical; }
+  textarea { width: 100%; height: 60px; font-family: monospace; font-size: 11px; padding: 6px; border: 1px solid #ccc; border-radius: 5px; resize: vertical; }
   .hint { background: #eef; padding: 8px; border-radius: 6px; font-size: 13px; }
   .status { font-size: 13px; color: #666; padding: 6px 10px; border-radius: 5px; background: #f0f0f0; margin: 6px 0; }
   .status.ok { background: #e6f5e6; color: #2a7a2a; }
@@ -41,10 +41,10 @@
 </head>
 <body>
 
-<h2>💬 Chat P2P (multi-peer)</h2>
+<h2>💬 Chat P2P (multi-peer + Link Mágico)</h2>
 
 <div id="setup" class="card">
-  <p class="hint">Funciona na mesma rede ou fora dela (4G).</p>
+  <p class="hint">Compartilhe links em vez de códigos gigantes.</p>
   <button id="btnHost" class="primary">🖥️ Sou Host</button>
   <button id="btnClient">📱 Sou Cliente</button>
 </div>
@@ -65,15 +65,15 @@
 <!-- CLIENTE -->
 <div id="clientView" class="card" style="display:none">
   <h3>📱 Cliente</h3>
-  <p>Cole a oferta do host:</p>
-  <textarea id="offerInput" placeholder="Cole aqui a oferta..."></textarea>
+  <p>Cole o <b>Link Mágico</b> do host ou a oferta:</p>
+  <textarea id="offerInput" placeholder="Cole o link aqui (ex: ...#offer=...) ou o código bruto..."></textarea>
   <button id="btnGenAnswer" class="primary">⚙️ Gerar resposta</button>
   <div class="status" id="clientStatus">aguardando oferta</div>
 
   <div id="answerArea" style="display:none">
-    <p>Copie a resposta abaixo e envie ao host:</p>
+    <p>Copie o <b>Link de Resposta</b> abaixo e envie ao host:</p>
     <textarea id="answerText" readonly></textarea>
-    <button id="btnCopyAnswer" class="small">📋 Copiar</button>
+    <button id="btnCopyAnswer" class="small primary">📋 Copiar Link</button>
   </div>
 </div>
 
@@ -96,6 +96,47 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 let room = null;
+
+// --- FUNÇÕES MÁGICAS DO LINK ---
+function encodeSdp(sdp) {
+  return btoa(encodeURIComponent(sdp)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function decodeSdp(hash) {
+  let b64 = hash.replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  return decodeURIComponent(atob(b64));
+}
+function getHashParam(key) {
+  const hash = window.location.hash.substring(1);
+  const params = new URLSearchParams(hash);
+  return params.get(key);
+}
+function extractSdp(input) {
+  if (!input) return '';
+  const t = input.trim();
+  if (t.startsWith('http')) {
+    try {
+      const url = new URL(t);
+      const hash = url.hash.substring(1);
+      const params = new URLSearchParams(hash);
+      if (params.has('offer')) return decodeSdp(params.get('offer'));
+      if (params.has('answer')) return decodeSdp(params.get('answer'));
+    } catch(e) {}
+  }
+  return t;
+}
+
+// --- AUTO-JOIN (Se abriu um link com #offer=) ---
+window.addEventListener('DOMContentLoaded', () => {
+  const offer = getHashParam('offer');
+  if (offer) {
+    $('setup').style.display = 'none';
+    $('clientView').style.display = 'block';
+    $('offerInput').value = window.location.href;
+    $('clientStatus').textContent = '✅ Link detectado! Clique em "Gerar resposta".';
+    $('clientStatus').className = 'status ok';
+  }
+});
 
 /* ============================================================
    HOST
@@ -141,6 +182,7 @@ async function addNewOffer() {
 
   try {
     const { slotId, sdp } = await room.createOfferForPeer();
+    const link = window.location.origin + window.location.pathname + '#offer=' + encodeSdp(sdp);
 
     const block = document.createElement('div');
     block.className = 'offer-block';
@@ -150,35 +192,52 @@ async function addNewOffer() {
         <span class="slot-id">${esc(slotId)}</span>
         <span class="offer-status">aguardando resposta</span>
       </div>
-      <textarea class="offer-sdp" readonly>${esc(sdp)}</textarea>
-      <button class="copy-offer small">📋 Copiar oferta</button>
-      <textarea class="answer-sdp" placeholder="Cole a resposta do peer aqui..."></textarea>
+      <textarea class="offer-sdp" readonly>${esc(link)}</textarea>
+      <button class="copy-offer small primary">🔗 Copiar Link Mágico</button>
+      <textarea class="answer-sdp" placeholder="Cole o Link de Resposta do peer aqui..."></textarea>
       <button class="apply-answer primary small">🔗 Conectar peer</button>
     `;
     $('offerList').appendChild(block);
 
     block.querySelector('.copy-offer').onclick = () => {
-      navigator.clipboard.writeText(sdp).then(() => {
+      navigator.clipboard.writeText(link).then(() => {
         const b = block.querySelector('.copy-offer');
         const o = b.textContent;
-        b.textContent = '✅ Copiado!';
-        setTimeout(() => b.textContent = o, 1200);
+        b.textContent = '✅ Link Copiado!';
+        setTimeout(() => b.textContent = o, 1500);
       });
     };
 
     block.querySelector('.apply-answer').onclick = async () => {
-      const answer = block.querySelector('.answer-sdp').value.trim();
-      if (!answer) return alert('Cole a resposta do peer');
+      const rawAnswer = block.querySelector('.answer-sdp').value.trim();
+      if (!rawAnswer) return alert('Cole a resposta do peer');
+      const answer = extractSdp(rawAnswer);
       block.querySelector('.offer-status').textContent = '⏳ Conectando...';
+      
       try {
         await room.acceptAnswerForSlot(slotId, answer);
+        
+        // Vigia a conexão: se falhar após 15s, avisa na tela.
+        const pc = room.slots.get(slotId).pc;
+        let isConnected = false;
+        pc.oniceconnectionstatechange = () => {
+          if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+            if (!isConnected) {
+              block.querySelector('.offer-status').textContent = '❌ Falha (NAT bloqueado)';
+              block.classList.add('failed');
+            }
+          }
+          if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+            isConnected = true;
+          }
+        };
       } catch (e) {
         block.querySelector('.offer-status').textContent = '❌ ' + e.message;
         block.classList.add('failed');
       }
     };
 
-    $('hostStatus').textContent = `✅ Oferta gerada (${slotId}). Envie ao peer.`;
+    $('hostStatus').textContent = `✅ Link gerado. Envie ao peer.`;
     $('hostStatus').className = 'status ok';
   } catch (e) {
     $('hostStatus').textContent = '❌ ' + e.message;
@@ -211,8 +270,9 @@ $('btnClient').onclick = () => {
 };
 
 $('btnGenAnswer').onclick = async () => {
-  const sdp = $('offerInput').value.trim();
-  if (!sdp) return alert('Cole a oferta do host');
+  const rawOffer = $('offerInput').value.trim();
+  if (!rawOffer) return alert('Cole o link ou oferta do host');
+  const offer = extractSdp(rawOffer);
 
   $('clientStatus').textContent = 'Processando...';
   $('clientStatus').className = 'status';
@@ -223,10 +283,12 @@ $('btnGenAnswer').onclick = async () => {
   room.onDirectoryChange = () => updateChatPeers();
 
   try {
-    const { sdp: answer } = await room.acceptOffer(sdp);
-    $('answerText').value = answer;
+    const { sdp: answerSdp } = await room.acceptOffer(offer);
+    const answerLink = window.location.origin + window.location.pathname + '#answer=' + encodeSdp(answerSdp);
+
+    $('answerText').value = answerLink;
     $('answerArea').style.display = 'block';
-    $('clientStatus').textContent = '✅ Resposta pronta. Copie e envie ao host.';
+    $('clientStatus').textContent = '✅ Link de Resposta pronto!';
     $('clientStatus').className = 'status ok';
   } catch (e) {
     $('clientStatus').textContent = '❌ ' + e.message;
@@ -239,8 +301,8 @@ $('btnCopyAnswer').onclick = () => {
   navigator.clipboard.writeText(t).then(() => {
     const b = $('btnCopyAnswer');
     const o = b.textContent;
-    b.textContent = '✅ Copiado!';
-    setTimeout(() => b.textContent = o, 1200);
+    b.textContent = '✅ Link Copiado!';
+    setTimeout(() => b.textContent = o, 1500);
   });
 };
 
