@@ -1,5 +1,5 @@
 // ============================================================
-// JoinsLookP2P — framework P2P com DSL SQL + multi-peer + STUN/TURN
+// JoinsLookP2P — framework P2P com DSL SQL + multi-peer
 // ============================================================
 
 const SQL = {
@@ -62,10 +62,10 @@ class JoinsLookP2P {
   constructor() {
     this.tables = new Map();
     this.listeners = [];
-    this.slots = new Map();
-    this.peerDirectory = new Map();
-    this.peers = new Map();
-    this.connectedPeers = new Set();
+    this.slots = new Map();              // slotId -> { pc, dc }
+    this.peerDirectory = new Map();      // peerId -> slotId (host)
+    this.peers = new Map();              // peerId -> estado
+    this.connectedPeers = new Set();     // peers conhecidos (peer view)
     this.peerId = 'P' + Math.random().toString(36).slice(2, 8).toUpperCase();
     this.role = null;
     this.options = {};
@@ -158,6 +158,7 @@ class JoinsLookP2P {
     }
   }
 
+  // ---------- Gossip ----------
   _gossip(msg) {
     msg._ttl = this.messageTTL;
     this._sendToNeighbors(msg);
@@ -165,12 +166,14 @@ class JoinsLookP2P {
 
   _sendToNeighbors(msg) {
     const json = JSON.stringify(msg);
+
     if (this.role === 'peer') {
       for (const { dc } of this.slots.values()) {
         if (dc?.readyState === 'open') dc.send(json);
       }
       return;
     }
+
     const neighbors = [...this.slots.entries()]
       .filter(([_, s]) => s.dc?.readyState === 'open')
       .slice(0, this.maxDirectPeers);
@@ -200,27 +203,14 @@ class JoinsLookP2P {
     }
   }
 
+  // ---------- WebRTC ----------
   async _newPC() {
-    // ⚡ STUN + TURN (OpenRelay) para furar NATs restritivos de 4G/5G
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        {
-          urls: [
-            'turn:openrelay.metered.ca:80',
-            'turn:openrelay.metered.ca:443',
-            'turn:openrelay.metered.ca:443?transport=tcp'
-          ],
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        }
-      ]
-    });
+    const pc = new RTCPeerConnection({ iceServers: [] });
     pc.oniceconnectionstatechange = () => this.onState?.(pc.iceConnectionState);
     return pc;
   }
 
-  async _waitIce(pc, timeout = 10000) {
+  async _waitIce(pc, timeout = 8000) {
     return new Promise(res => {
       if (pc.iceGatheringState === 'complete') return res();
       const check = () => {
@@ -243,12 +233,16 @@ class JoinsLookP2P {
       try {
         dc.send(JSON.stringify({ op: 'hello', peerId: this.peerId }));
         if (this.role === 'host') {
+          // snapshot inicial de estado
           for (const [table, rows] of this.tables) {
             for (const row of rows) {
               dc.send(JSON.stringify({ op: 'insert', table, row }));
             }
           }
-          dc.send(JSON.stringify({ op: 'directory', peers: [...this.peerDirectory.keys()] }));
+          dc.send(JSON.stringify({
+            op: 'directory',
+            peers: [...this.peerDirectory.keys()]
+          }));
         }
       } catch (e) { console.error('[onopen send]', e); }
       this.onConnect?.();
@@ -268,6 +262,7 @@ class JoinsLookP2P {
     dc.onmessage = e => {
       try {
         const msg = JSON.parse(e.data);
+
         if (msg.op === 'hello') {
           if (this.role === 'host') {
             this.peerDirectory.set(msg.peerId, slotId);
@@ -276,23 +271,29 @@ class JoinsLookP2P {
           }
           return;
         }
+
         if (msg.op === 'directory') {
           this.connectedPeers = new Set(msg.peers.filter(p => p !== this.peerId));
           this.onDirectoryChange?.();
           return;
         }
+
         this._receive(msg, slotId);
       } catch (err) { console.warn('msg inválida', err); }
     };
   }
 
   _broadcastDirectory() {
-    const json = JSON.stringify({ op: 'directory', peers: [...this.peerDirectory.keys()] });
+    const json = JSON.stringify({
+      op: 'directory',
+      peers: [...this.peerDirectory.keys()]
+    });
     for (const { dc } of this.slots.values()) {
       if (dc?.readyState === 'open') dc.send(json);
     }
   }
 
+  // ---------- Multi-peer API ----------
   async createOfferForPeer(slotId) {
     slotId = slotId || 'peer-' + this._uid().slice(0, 6);
     const pc = await this._newPC();
@@ -311,7 +312,10 @@ class JoinsLookP2P {
     if (slot.pc.signalingState !== 'have-local-offer') {
       throw new Error('Slot já conectado ou estado inválido: ' + slot.pc.signalingState);
     }
-    await slot.pc.setRemoteDescription({ type: 'answer', sdp: normalizeSdp(answerSdp) });
+    await slot.pc.setRemoteDescription({
+      type: 'answer',
+      sdp: normalizeSdp(answerSdp)
+    });
   }
 
   async acceptOffer(offerSdp) {
@@ -321,7 +325,10 @@ class JoinsLookP2P {
       this.slots.set(slotId, { pc, dc: e.channel });
       this._wireSlot(slotId, e.channel);
     };
-    await pc.setRemoteDescription({ type: 'offer', sdp: normalizeSdp(offerSdp) });
+    await pc.setRemoteDescription({
+      type: 'offer',
+      sdp: normalizeSdp(offerSdp)
+    });
     const ans = await pc.createAnswer();
     await pc.setLocalDescription(ans);
     await this._waitIce(pc);
