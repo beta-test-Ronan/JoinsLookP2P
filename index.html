@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Chat LAN P2P — Multi-peer</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; background: #f5f5f5; }
+  h2, h3 { margin-top: 0; }
+  .card { background: #fff; border-radius: 10px; padding: 16px; margin: 10px 0; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  button { padding: 8px 14px; margin: 4px 4px 4px 0; cursor: pointer; border-radius: 6px; border: 1px solid #ccc; background: #fff; font-size: 14px; }
+  button:hover { background: #eee; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: #4a90e2; color: #fff; border-color: #4a90e2; }
+  button.primary:hover { background: #3a7bc8; }
+  button.small { padding: 5px 10px; font-size: 12px; }
+  textarea { width: 100%; height: 70px; font-family: monospace; font-size: 11px; padding: 6px; border: 1px solid #ccc; border-radius: 5px; resize: vertical; }
+  .hint { background: #eef; padding: 8px; border-radius: 6px; font-size: 13px; }
+  .status { font-size: 13px; color: #666; padding: 6px 10px; border-radius: 5px; background: #f0f0f0; margin: 6px 0; }
+  .status.ok { background: #e6f5e6; color: #2a7a2a; }
+  .status.err { background: #fae6e6; color: #a42a2a; }
+  .code { font-family: monospace; background: #eef; padding: 1px 6px; border-radius: 4px; font-weight: bold; }
+  .offer-block { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin: 10px 0; background: #fff; }
+  .offer-block.connected { background: #e6f5e6; border-color: #a4d4a4; }
+  .offer-block.failed { background: #fae6e6; border-color: #d4a4a4; }
+  .offer-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; }
+  .slot-id { font-family: monospace; font-weight: bold; background: #eef; padding: 1px 6px; border-radius: 4px; }
+  .offer-status { color: #666; }
+  .offer-block.connected .offer-status { color: #2a7a2a; font-weight: bold; }
+  .offer-block.failed .offer-status { color: #a42a2a; font-weight: bold; }
+  .offer-block textarea { margin: 4px 0; }
+  #messages { border: 1px solid #ddd; height: 300px; overflow-y: auto; padding: 8px; background: #fafafa; border-radius: 6px; margin-bottom: 8px; }
+  #messages p { margin: 3px 0; font-size: 14px; }
+  #messages p b { color: #4a90e2; }
+  #messages p.me b { color: #2a9a2a; }
+  #chat-bar { display: flex; gap: 6px; }
+  #chat-bar input { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+  .peers { font-size: 13px; color: #666; margin: 4px 0; }
+  .peer-chip { display: inline-block; padding: 2px 8px; background: #d4e8d4; color: #2a5a2a; border-radius: 10px; font-size: 12px; font-family: monospace; margin: 2px; }
+</style>
+</head>
+<body>
+
+<h2>💬 Chat P2P (multi-peer)</h2>
+
+<div id="setup" class="card">
+  <p class="hint">Funciona na mesma rede ou fora dela (4G).</p>
+  <button id="btnHost" class="primary">🖥️ Sou Host</button>
+  <button id="btnClient">📱 Sou Cliente</button>
+</div>
+
+<!-- HOST -->
+<div id="hostView" class="card" style="display:none">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <h3>🖥️ Host — Sala: <span class="code" id="roomCode">...</span></h3>
+    <button id="btnToChat" class="small" style="display:none">💬 Ir para o chat</button>
+  </div>
+  <div class="peers">Peers: <span id="hostPeers">nenhum</span></div>
+
+  <div id="offerList"></div>
+  <button id="btnNewOffer" class="primary">➕ Adicionar peer</button>
+  <div class="status" id="hostStatus">pronto</div>
+</div>
+
+<!-- CLIENTE -->
+<div id="clientView" class="card" style="display:none">
+  <h3>📱 Cliente</h3>
+  <p>Cole a oferta do host:</p>
+  <textarea id="offerInput" placeholder="Cole aqui a oferta..."></textarea>
+  <button id="btnGenAnswer" class="primary">⚙️ Gerar resposta</button>
+  <div class="status" id="clientStatus">aguardando oferta</div>
+
+  <div id="answerArea" style="display:none">
+    <p>Copie a resposta abaixo e envie ao host:</p>
+    <textarea id="answerText" readonly></textarea>
+    <button id="btnCopyAnswer" class="small">📋 Copiar</button>
+  </div>
+</div>
+
+<!-- CHAT -->
+<div id="chatView" class="card" style="display:none">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <h3>💬 Chat — <span class="code" id="chatMyId"></span></h3>
+    <button id="btnManagePeers" class="small" style="display:none">➕ Gerenciar peers</button>
+  </div>
+  <div class="peers">Online: <span id="chatPeers">-</span></div>
+  <div id="messages"></div>
+  <div id="chat-bar">
+    <input id="msgInput" placeholder="Digite uma mensagem...">
+    <button id="btnSend" class="primary">Enviar</button>
+  </div>
+</div>
+
+<script src="joinslook.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+let room = null;
+
+/* ============================================================
+   HOST
+   ============================================================ */
+$('btnHost').onclick = async () => {
+  $('setup').style.display = 'none';
+  $('hostView').style.display = 'block';
+
+  room = await JoinsLookP2P.create(`CREATE ROOM 'demo' AS LATTICE(16)`);
+  $('roomCode').textContent = room.code;
+
+  room.on(`SELECT * FROM chat`, renderChat);
+
+  room.onPeerConnect = slotId => {
+    const block = document.querySelector(`.offer-block[data-slot="${slotId}"]`);
+    if (block) {
+      block.classList.remove('failed');
+      block.classList.add('connected');
+      block.querySelector('.offer-status').textContent = '✅ conectado';
+      block.querySelectorAll('textarea, button').forEach(el => el.disabled = true);
+    }
+    updateHostUI();
+  };
+
+  room.onPeerDisconnect = slotId => {
+    const block = document.querySelector(`.offer-block[data-slot="${slotId}"]`);
+    if (block) {
+      block.classList.remove('connected');
+      block.classList.add('failed');
+      block.querySelector('.offer-status').textContent = '❌ desconectado';
+    }
+    updateHostUI();
+  };
+
+  room.onDirectoryChange = () => updateHostUI();
+
+  await addNewOffer();
+};
+
+async function addNewOffer() {
+  $('hostStatus').textContent = 'Gerando oferta...';
+  $('hostStatus').className = 'status';
+
+  try {
+    const { slotId, sdp } = await room.createOfferForPeer();
+
+    const block = document.createElement('div');
+    block.className = 'offer-block';
+    block.dataset.slot = slotId;
+    block.innerHTML = `
+      <div class="offer-header">
+        <span class="slot-id">${esc(slotId)}</span>
+        <span class="offer-status">aguardando resposta</span>
+      </div>
+      <textarea class="offer-sdp" readonly>${esc(sdp)}</textarea>
+      <button class="copy-offer small">📋 Copiar oferta</button>
+      <textarea class="answer-sdp" placeholder="Cole a resposta do peer aqui..."></textarea>
+      <button class="apply-answer primary small">🔗 Conectar peer</button>
+    `;
+    $('offerList').appendChild(block);
+
+    block.querySelector('.copy-offer').onclick = () => {
+      navigator.clipboard.writeText(sdp).then(() => {
+        const b = block.querySelector('.copy-offer');
+        const o = b.textContent;
+        b.textContent = '✅ Copiado!';
+        setTimeout(() => b.textContent = o, 1200);
+      });
+    };
+
+    block.querySelector('.apply-answer').onclick = async () => {
+      const answer = block.querySelector('.answer-sdp').value.trim();
+      if (!answer) return alert('Cole a resposta do peer');
+      block.querySelector('.offer-status').textContent = '⏳ Conectando...';
+      try {
+        await room.acceptAnswerForSlot(slotId, answer);
+      } catch (e) {
+        block.querySelector('.offer-status').textContent = '❌ ' + e.message;
+        block.classList.add('failed');
+      }
+    };
+
+    $('hostStatus').textContent = `✅ Oferta gerada (${slotId}). Envie ao peer.`;
+    $('hostStatus').className = 'status ok';
+  } catch (e) {
+    $('hostStatus').textContent = '❌ ' + e.message;
+    $('hostStatus').className = 'status err';
+  }
+}
+
+$('btnNewOffer').onclick = () => addNewOffer();
+
+function updateHostUI() {
+  const peerIds = [...room.peerDirectory.keys()];
+  $('hostPeers').innerHTML = peerIds.length
+    ? peerIds.map(p => `<span class="peer-chip">${esc(p)}</span>`).join('')
+    : 'nenhum';
+  $('btnToChat').style.display = peerIds.length ? 'inline-block' : 'none';
+}
+
+$('btnToChat').onclick = () => enterChat(true);
+$('btnManagePeers').onclick = () => {
+  $('chatView').style.display = 'none';
+  $('hostView').style.display = 'block';
+};
+
+/* ============================================================
+   CLIENTE
+   ============================================================ */
+$('btnClient').onclick = () => {
+  $('setup').style.display = 'none';
+  $('clientView').style.display = 'block';
+};
+
+$('btnGenAnswer').onclick = async () => {
+  const sdp = $('offerInput').value.trim();
+  if (!sdp) return alert('Cole a oferta do host');
+
+  $('clientStatus').textContent = 'Processando...';
+  $('clientStatus').className = 'status';
+
+  room = await JoinsLookP2P.join('JOINED');
+  room.on(`SELECT * FROM chat`, renderChat);
+  room.onPeerConnect = () => enterChat(false);
+  room.onDirectoryChange = () => updateChatPeers();
+
+  try {
+    const { sdp: answer } = await room.acceptOffer(sdp);
+    $('answerText').value = answer;
+    $('answerArea').style.display = 'block';
+    $('clientStatus').textContent = '✅ Resposta pronta. Copie e envie ao host.';
+    $('clientStatus').className = 'status ok';
+  } catch (e) {
+    $('clientStatus').textContent = '❌ ' + e.message;
+    $('clientStatus').className = 'status err';
+  }
+};
+
+$('btnCopyAnswer').onclick = () => {
+  const t = $('answerText').value;
+  navigator.clipboard.writeText(t).then(() => {
+    const b = $('btnCopyAnswer');
+    const o = b.textContent;
+    b.textContent = '✅ Copiado!';
+    setTimeout(() => b.textContent = o, 1200);
+  });
+};
+
+/* ============================================================
+   CHAT
+   ============================================================ */
+function enterChat(isHost) {
+  $('hostView').style.display = 'none';
+  $('clientView').style.display = 'none';
+  $('chatView').style.display = 'block';
+  $('chatMyId').textContent = room.peerId;
+  $('btnManagePeers').style.display = isHost ? 'inline-block' : 'none';
+  updateChatPeers();
+  $('msgInput').focus();
+}
+
+function updateChatPeers() {
+  if (!room) return;
+  const peers = room.role === 'host'
+    ? [...room.peerDirectory.keys()]
+    : [...room.connectedPeers];
+  $('chatPeers').innerHTML = peers.length
+    ? peers.map(p => `<span class="peer-chip">${esc(p)}</span>`).join('')
+    : '<span style="color:#999">só você</span>';
+}
+
+function renderChat(rows) {
+  if (!rows.length) {
+    $('messages').innerHTML = '<p style="color:#999">sem mensagens</p>';
+    return;
+  }
+  $('messages').innerHTML = rows.map(r => {
+    const me = r._from === room.peerId;
+    return `<p class="${me ? 'me' : ''}"><b>${esc(r._from || 'peer')}</b>: ${esc(r.text || '')}</p>`;
+  }).join('');
+  $('messages').scrollTop = $('messages').scrollHeight;
+}
+
+$('btnSend').onclick = async () => {
+  const txt = $('msgInput').value.trim();
+  if (!txt || !room) return;
+  await room.exec(`INSERT INTO chat (text) VALUES ('${txt.replace(/'/g, "''")}')`);
+  $('msgInput').value = '';
+  $('msgInput').focus();
+};
+$('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnSend').click(); });
+</script>
+</body>
+</html>
