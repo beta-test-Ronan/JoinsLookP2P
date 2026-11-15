@@ -1,30 +1,19 @@
 // ============================================================
-// JoinsLookP2P — framework P2P com DSL SQL + multi-peer
+// JoinsLookP2P — Framework P2P (Server + Client Sincronizados)
 // ============================================================
 
 const SQL = {
   parse(raw) {
     const s = raw.trim().replace(/\s+/g, ' ');
     let m;
-    m = s.match(/^CREATE ROOM '([^']+)' AS LATTICE\((\d+)\)$/i);
-    if (m) return { type: 'create', name: m[1], size: +m[2] };
-    m = s.match(/^JOIN '([^']+)'$/i);
-    if (m) return { type: 'join', code: m[1] };
-    m = s.match(/^INSERT INTO (\w+) \(([^)]+)\) VALUES \((.+)\)$/i);
-    if (m) return {
-      type: 'insert', table: m[1],
-      cols: m[2].split(',').map(x => x.trim()),
-      vals: this.splitValues(m[3])
-    };
-    m = s.match(/^SELECT \* FROM (\w+)(?: WHERE (\w+) (=|>|<) '?([^']+)'?)?$/i);
-    if (m) return {
-      type: 'select', table: m[1],
-      where: m[2] ? { col: m[2], op: m[3], val: m[4] } : null
-    };
-    m = s.match(/^DELETE FROM (\w+) WHERE (\w+) = '([^']+)'$/i);
-    if (m) return { type: 'delete', table: m[1], where: { col: m[2], val: m[3] } };
-    m = s.match(/^UPDATE ME SET (\w+) = '([^']+)'$/i);
-    if (m) return { type: 'update_me', col: m[1], val: m[2] };
+    if ((m = s.match(/^INSERT INTO (\w+) \(([^)]+)\) VALUES \((.+)\)$/i))) 
+      return { type: 'insert', table: m[1], cols: m[2].split(',').map(x => x.trim()), vals: this.splitValues(m[3]) };
+    if ((m = s.match(/^UPDATE (\w+) SET (.+) WHERE (\w+) = '([^']+)'$/i))) 
+      return { type: 'update', table: m[1], set: this.parseSet(m[2]), where: { col: m[3], val: m[4] } };
+    if ((m = s.match(/^SELECT \* FROM (\w+)(?: WHERE (\w+) (=|>|<) '?([^']+)'?)?$/i))) 
+      return { type: 'select', table: m[1], where: m[2] ? { col: m[2], op: m[3], val: m[4] } : null };
+    if ((m = s.match(/^DELETE FROM (\w+) WHERE (\w+) = '([^']+)'$/i))) 
+      return { type: 'delete', table: m[1], where: { col: m[2], val: m[3] } };
     throw new Error('SQL inválido: ' + raw);
   },
   splitValues(raw) {
@@ -37,119 +26,329 @@ const SQL = {
     if (buf.trim()) out.push(this.castVal(buf.trim()));
     return out;
   },
+  parseSet(raw) {
+    const out = {};
+    raw.split(',').forEach(pair => {
+      const [k, v] = pair.split('=').map(x => x.trim());
+      out[k] = this.castVal(v);
+    });
+    return out;
+  },
   castVal(s) {
     if (s.startsWith("'") && s.endsWith("'")) return s.slice(1, -1);
-    if (s === 'true') return true;
-    if (s === 'false') return false;
     if (!isNaN(+s)) return +s;
     return s;
   }
 };
 
-async function sha256(str) {
-  const buf = new TextEncoder().encode(str);
-  const h = await crypto.subtle.digest('SHA-256', buf);
-  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function normalizeSdp(sdp) {
-  return sdp.trim().replace(/\r\n|\r|\n/g, '\n')
-    .split('\n').map(l => l.trimEnd()).join('\n')
-    .replace(/\n/g, '\r\n') + '\r\n';
-}
-
-class JoinsLookP2P {
-  constructor() {
+// ============================================================
+// CLASSE 1: SERVIDOR (Autoridade Total)
+// ============================================================
+class JoinsLookServer {
+  constructor(manualIp = '') {
     this.tables = new Map();
     this.listeners = [];
-    this.slots = new Map();              // slotId -> { pc, dc }
-    this.peerDirectory = new Map();      // peerId -> slotId (host)
-    this.peers = new Map();              // peerId -> estado
-    this.connectedPeers = new Set();     // peers conhecidos (peer view)
-    this.peerId = 'P' + Math.random().toString(36).slice(2, 8).toUpperCase();
-    this.role = null;
-    this.options = {};
-    this.maxDirectPeers = 6;
-    this.seenMessages = new Set();
-    this.messageTTL = 5;
-    this.me = { peerId: this.peerId };
+    this.slots = new Map();
+    this.peerDirectory = new Map();
+    this.manualIp = manualIp;
+    this.blockHeight = 0;
+    this.db = null;
+    this.serverKey = 'sk_' + Math.random().toString(36).slice(2, 10); 
   }
 
-  static async create(sql, options = {}) {
+  async start(isNewGame = true) {
+    await this._initDB();
+    if (isNewGame) await this._clearDB();
+    else await this._loadFromDB();
+
+    const pc = await this._newPC();
+    const dc = pc.createDataChannel('game');
+    this.slots.set('host', { pc, dc });
+    this._wireSlot(dc, 'host');
+    
+    await pc.setLocalDescription(await pc.createOffer());
+    await this._waitIce(pc);
+    
+    const sdp = this._replaceMdns(pc.localDescription.sdp);
+    const b64 = btoa(encodeURIComponent(sdp)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    return `${window.location.href.split('#')[0]}#offer=${b64}&key=${this.serverKey}`;
+  }
+
+  async acceptAnswer(link) {
+    const sdp = this._extractSdp(link);
+    const slot = this.slots.get('host');
+    if (slot && slot.pc.signalingState !== 'stable') {
+      await slot.pc.setRemoteDescription({ type: 'answer', sdp: this._normalizeSdp(sdp) });
+    }
+  }
+
+  async resetGame() {
+    this.tables.clear();
+    this.blockHeight = 0;
+    await this._clearDB();
+    this._broadcast({ op: 'server_reset' });
+  }
+
+  onAction(callback) { this._actionCallback = callback; }
+
+  onChange(sql, callback) {
     const stmt = SQL.parse(sql);
-    if (stmt.type !== 'create') throw new Error('Use CREATE ROOM');
-    const room = new JoinsLookP2P();
-    room.role = 'host';
-    room.name = stmt.name;
-    room.latticeSize = stmt.size;
-    room.options = options;
-    room.code = (await sha256(stmt.name + '|' + stmt.size)).slice(0, 8).toUpperCase();
-    return room;
-  }
-
-  static async join(code, options = {}) {
-    const room = new JoinsLookP2P();
-    room.role = 'peer';
-    room.code = code.toUpperCase();
-    room.options = options;
-    return room;
+    this.listeners.push({ stmt, callback });
+    callback(this._query(stmt));
   }
 
   async exec(sql) {
     const stmt = SQL.parse(sql);
+
     if (stmt.type === 'insert') {
-      const row = { _id: this._uid(), _from: this.peerId, _ts: Date.now() };
+      const row = { _id: Math.random().toString(36).slice(2), _from: 'HOST', _ts: Date.now() };
       stmt.cols.forEach((c, i) => row[c] = stmt.vals[i]);
       this._addRow(stmt.table, row);
-      this.seenMessages.add(row._id);
-      this._gossip({ op: 'insert', table: stmt.table, row });
+      this._broadcast({ op: 'insert', table: stmt.table, row });
+      await this._saveToDB();
       return row;
     }
-    if (stmt.type === 'select') return this._query(stmt);
+
+    if (stmt.type === 'update') {
+      const rows = this.tables.get(stmt.table) || [];
+      const row = rows.find(r => String(r[stmt.where.col]) === stmt.where.val);
+      if (row) {
+        Object.assign(row, stmt.set);
+        this._notify(stmt.table);
+        this.blockHeight++;
+        this._broadcast({ op: 'update', table: stmt.table, where: stmt.where, set: stmt.set, block: this.blockHeight });
+        await this._saveToDB();
+      }
+      return row;
+    }
+
     if (stmt.type === 'delete') {
       const rows = this.tables.get(stmt.table) || [];
       this.tables.set(stmt.table, rows.filter(r => String(r[stmt.where.col]) !== stmt.where.val));
       this._notify(stmt.table);
-      this._gossip({ op: 'delete', table: stmt.table, where: stmt.where });
-      return;
+      this._broadcast({ op: 'delete', table: stmt.table, where: stmt.where });
+      await this._saveToDB();
     }
-    if (stmt.type === 'update_me') {
-      this.me[stmt.col] = stmt.val;
-      this._gossip({ op: 'me', peerId: this.peerId, col: stmt.col, val: stmt.val });
-      return this.me;
-    }
-    throw new Error('Comando inválido: ' + stmt.type);
+
+    if (stmt.type === 'select') return this._query(stmt);
   }
 
-  on(sql, callback) {
-    const stmt = SQL.parse(sql);
-    const entry = { stmt, callback };
-    this.listeners.push(entry);
-    callback(this._query(stmt));
-    return () => { this.listeners = this.listeners.filter(l => l !== entry); };
+  _broadcast(msg) {
+    const json = JSON.stringify(msg);
+    for (const { dc } of this.slots.values()) {
+      if (dc?.readyState === 'open') dc.send(json);
+    }
   }
 
-  _uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+  _wireSlot(dc, slotId) {
+    dc.onopen = () => {
+      dc.send(JSON.stringify({ op: 'hello' }));
+      for (const [table, rows] of this.tables) {
+        for (const row of rows) dc.send(JSON.stringify({ op: 'insert', table, row }));
+      }
+      dc.send(JSON.stringify({ op: 'sync', block: this.blockHeight }));
+      this.onConnect?.();
+    };
+    
+    dc.onmessage = e => {
+      const msg = JSON.parse(e.data);
+      if (msg.op === 'join') {
+        if (msg.key !== this.serverKey) { 
+          console.warn('Chave inválida do cliente:', msg.key, 'Esperado:', this.serverKey);
+          dc.close(); return; 
+        }
+        this.peerDirectory.set(msg.peerId, slotId);
+      } else if (msg.op === 'action') {
+        if (this._actionCallback) this._actionCallback(msg.action);
+      }
+    };
+  }
 
   _addRow(table, row) {
     if (!this.tables.has(table)) this.tables.set(table, []);
     const rows = this.tables.get(table);
-    if (rows.some(r => r._id === row._id)) return;
-    rows.push(row);
-    this._notify(table);
+    if (!rows.some(r => r._id === row._id)) {
+      rows.push(row);
+      this._notify(table);
+    }
   }
-
+  
   _query(stmt) {
     const rows = this.tables.get(stmt.table) || [];
     if (!stmt.where) return [...rows];
-    const { col, op, val } = stmt.where;
-    return rows.filter(r => {
-      const v = String(r[col]);
-      if (op === '=') return v === val;
-      if (op === '>') return +v > +val;
-      if (op === '<') return +v < +val;
-      return false;
+    return rows.filter(r => String(r[stmt.where.col]) === stmt.where.val);
+  }
+  
+  _notify(table) {
+    for (const { stmt, callback } of this.listeners) {
+      if (stmt.table === table) callback(this._query(stmt));
+    }
+  }
+
+  async _initDB() {
+    return new Promise((resolve) => {
+      const req = indexedDB.open('JoinsLookDB', 1);
+      req.onupgradeneeded = e => e.target.result.createObjectStore('state');
+      req.onsuccess = e => { this.db = e.target.result; resolve(); };
     });
+  }
+  async _clearDB() {
+    if (!this.db) return;
+    const tx = this.db.transaction('state', 'readwrite');
+    tx.objectStore('state').clear();
+  }
+  async _loadFromDB() {
+    if (!this.db) return;
+    return new Promise(resolve => {
+      const tx = this.db.transaction('state', 'readonly');
+      const req = tx.objectStore('state').get('current');
+      req.onsuccess = () => {
+        if (req.result) {
+          const data = JSON.parse(req.result);
+          this.tables = new Map(data.tables);
+          this.blockHeight = data.blockHeight || 0;
+        }
+        resolve();
+      };
+    });
+  }
+  async _saveToDB() {
+    if (!this.db) return;
+    const data = JSON.stringify({ tables: [...this.tables], blockHeight: this.blockHeight });
+    const tx = this.db.transaction('state', 'readwrite');
+    tx.objectStore('state').put(data, 'current');
+  }
+
+  async _newPC() { return new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }); }
+  async _waitIce(pc) {
+    return new Promise(res => {
+      if (pc.iceGatheringState === 'complete') return res();
+      pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') res(); });
+      setTimeout(res, 3000);
+    });
+  }
+  _replaceMdns(sdp) { return this.manualIp ? sdp.replace(/[a-zA-Z0-9-]+\.local/g, this.manualIp) : sdp; }
+  _normalizeSdp(sdp) { return sdp.trim().replace(/\r\n|\r|\n/g, '\n').split('\n').map(l => l.trimEnd()).join('\n').replace(/\n/g, '\r\n') + '\r\n'; }
+  
+  // BLINDAGEM DO LINK
+  _extractSdp(input) {
+    if (!input) throw new Error('O campo está vazio.');
+    const t = input.trim();
+    
+    // Se for o SDP puro
+    if (t.startsWith('v=0')) return t;
+
+    // Procura por offer= ou answer= e captura apenas caracteres válidos de Base64 URL
+    const match = t.match(/(?:offer|answer)=([a-zA-Z0-9\-_]+)/);
+    if (!match) {
+      console.log("Texto recebido:", t);
+      throw new Error('Link inválido. Certifique-se de copiar o link inteiro.');
+    }
+
+    let b64 = match[1].replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    
+    // Corrige o padding
+    while (b64.length % 4) b64 += '=';
+
+    try {
+      const decoded = decodeURIComponent(atob(b64));
+      if (!decoded.startsWith('v=0')) throw new Error('Código não é um SDP válido.');
+      return decoded;
+    } catch (e) {
+      console.error("Erro no Base64:", e);
+      throw new Error('Link corrompido. Copie o link completo novamente.');
+    }
+  }
+}
+
+// ============================================================
+// CLASSE 2: CLIENTE (Apenas Jogador)
+// ============================================================
+class JoinsLookClient {
+  constructor(manualIp = '') {
+    this.tables = new Map();
+    this.listeners = [];
+    this.manualIp = manualIp;
+    this.pc = null;
+    this.dc = null;
+    this.serverKey = null;
+    this.peerId = 'P' + Math.random().toString(36).slice(2, 6).toUpperCase();
+  }
+
+  async join(link) {
+    // Captura a chave do servidor
+    const keyMatch = link.match(/key=([a-zA-Z0-9_]+)/);
+    this.serverKey = keyMatch ? keyMatch[1] : 'unknown';
+
+    const sdp = this._extractSdp(link);
+    this.pc = await this._newPC();
+    
+    this.pc.ondatachannel = e => {
+      this.dc = e.channel;
+      this._wireSlot();
+    };
+
+    await this.pc.setRemoteDescription({ type: 'offer', sdp: this._normalizeSdp(sdp) });
+    await this.pc.setLocalDescription(await this.pc.createAnswer());
+    await this._waitIce(this.pc);
+
+    const sdpAns = this._replaceMdns(this.pc.localDescription.sdp);
+    const b64 = btoa(encodeURIComponent(sdpAns)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    return `${window.location.href.split('#')[0]}#answer=${b64}`;
+  }
+
+  sendAction(action) {
+    if (this.dc?.readyState === 'open') {
+      this.dc.send(JSON.stringify({ op: 'action', action }));
+    }
+  }
+
+  onChange(sql, callback) {
+    const stmt = SQL.parse(sql);
+    this.listeners.push({ stmt, callback });
+    callback(this._query(stmt));
+  }
+
+  _wireSlot() {
+    this.dc.onopen = () => {
+      this.dc.send(JSON.stringify({ op: 'join', peerId: this.peerId, key: this.serverKey }));
+      this.onConnect?.();
+    };
+    
+    this.dc.onmessage = e => {
+      const msg = JSON.parse(e.data);
+      
+      if (msg.op === 'insert') {
+        this._addRow(msg.table, msg.row);
+      } 
+      else if (msg.op === 'update') {
+        const rows = this.tables.get(msg.table) || [];
+        const row = rows.find(r => String(r[msg.where.col]) === msg.where.val);
+        if (row) {
+          Object.assign(row, msg.set);
+          this._notify(msg.table);
+        }
+      } 
+      else if (msg.op === 'delete') {
+        const rows = this.tables.get(msg.table) || [];
+        this.tables.set(msg.table, rows.filter(r => String(r[msg.where.col]) !== msg.where.val));
+        this._notify(msg.table);
+      } 
+      else if (msg.op === 'server_reset') {
+        this.tables.clear();
+        for (const { stmt } of this.listeners) this._notify(stmt.table);
+        this.onReset?.();
+      }
+    };
+  }
+
+  _addRow(table, row) {
+    if (!this.tables.has(table)) this.tables.set(table, []);
+    const rows = this.tables.get(table);
+    if (!rows.some(r => r._id === row._id)) {
+      rows.push(row);
+      this._notify(table);
+    }
   }
 
   _notify(table) {
@@ -158,180 +357,41 @@ class JoinsLookP2P {
     }
   }
 
-  // ---------- Gossip ----------
-  _gossip(msg) {
-    msg._ttl = this.messageTTL;
-    this._sendToNeighbors(msg);
+  _query(stmt) {
+    const rows = this.tables.get(stmt.table) || [];
+    if (!stmt.where) return [...rows];
+    return rows.filter(r => String(r[stmt.where.col]) === stmt.where.val);
   }
 
-  _sendToNeighbors(msg) {
-    const json = JSON.stringify(msg);
-
-    if (this.role === 'peer') {
-      for (const { dc } of this.slots.values()) {
-        if (dc?.readyState === 'open') dc.send(json);
-      }
-      return;
-    }
-
-    const neighbors = [...this.slots.entries()]
-      .filter(([_, s]) => s.dc?.readyState === 'open')
-      .slice(0, this.maxDirectPeers);
-    for (const [_, slot] of neighbors) {
-      if (slot.dc?.readyState === 'open') slot.dc.send(json);
-    }
-  }
-
-  _receive(msg, fromSlot) {
-    const key = msg.row?._id;
-    if (key && this.seenMessages.has(key)) return;
-    if (key) this.seenMessages.add(key);
-
-    if (msg.op === 'insert') {
-      this._addRow(msg.table, msg.row);
-    } else if (msg.op === 'delete') {
-      const rows = this.tables.get(msg.table) || [];
-      this.tables.set(msg.table, rows.filter(r => String(r[msg.where.col]) !== msg.where.val));
-      this._notify(msg.table);
-    } else if (msg.op === 'me') {
-      this.peers.set(msg.peerId, { ...this.peers.get(msg.peerId), [msg.col]: msg.val });
-    }
-
-    if (msg._ttl > 0) {
-      msg._ttl--;
-      this._sendToNeighbors(msg);
-    }
-  }
-
-  // ---------- WebRTC ----------
-  async _newPC() {
-    const pc = new RTCPeerConnection({ iceServers: [] });
-    pc.oniceconnectionstatechange = () => this.onState?.(pc.iceConnectionState);
-    return pc;
-  }
-
-  async _waitIce(pc, timeout = 8000) {
+  async _newPC() { return new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }); }
+  async _waitIce(pc) {
     return new Promise(res => {
       if (pc.iceGatheringState === 'complete') return res();
-      const check = () => {
-        if (pc.iceGatheringState === 'complete') {
-          pc.removeEventListener('icegatheringstatechange', check);
-          clearTimeout(t);
-          res();
-        }
-      };
-      pc.addEventListener('icegatheringstatechange', check);
-      const t = setTimeout(() => {
-        pc.removeEventListener('icegatheringstatechange', check);
-        res();
-      }, timeout);
+      pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') res(); });
+      setTimeout(res, 3000);
     });
   }
+  _replaceMdns(sdp) { return this.manualIp ? sdp.replace(/[a-zA-Z0-9-]+\.local/g, this.manualIp) : sdp; }
+  _normalizeSdp(sdp) { return sdp.trim().replace(/\r\n|\r|\n/g, '\n').split('\n').map(l => l.trimEnd()).join('\n').replace(/\n/g, '\r\n') + '\r\n'; }
+  
+  // MESMA BLINDAGEM NO CLIENTE
+  _extractSdp(input) {
+    if (!input) throw new Error('O campo está vazio.');
+    const t = input.trim();
+    if (t.startsWith('v=0')) return t;
 
-  _wireSlot(slotId, dc) {
-    dc.onopen = () => {
-      try {
-        dc.send(JSON.stringify({ op: 'hello', peerId: this.peerId }));
-        if (this.role === 'host') {
-          // snapshot inicial de estado
-          for (const [table, rows] of this.tables) {
-            for (const row of rows) {
-              dc.send(JSON.stringify({ op: 'insert', table, row }));
-            }
-          }
-          dc.send(JSON.stringify({
-            op: 'directory',
-            peers: [...this.peerDirectory.keys()]
-          }));
-        }
-      } catch (e) { console.error('[onopen send]', e); }
-      this.onConnect?.();
-      this.onPeerConnect?.(slotId);
-    };
+    const match = t.match(/(?:offer|answer)=([a-zA-Z0-9\-_]+)/);
+    if (!match) throw new Error('Link inválido. O texto colado não parece um Link Mágico.');
 
-    dc.onclose = () => {
-      for (const [peerId, sid] of [...this.peerDirectory]) {
-        if (sid === slotId) this.peerDirectory.delete(peerId);
-      }
-      this.slots.delete(slotId);
-      if (this.role === 'host') this._broadcastDirectory();
-      this.onDisconnect?.();
-      this.onPeerDisconnect?.(slotId);
-    };
+    let b64 = match[1].replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
 
-    dc.onmessage = e => {
-      try {
-        const msg = JSON.parse(e.data);
-
-        if (msg.op === 'hello') {
-          if (this.role === 'host') {
-            this.peerDirectory.set(msg.peerId, slotId);
-            this._broadcastDirectory();
-            this.onDirectoryChange?.();
-          }
-          return;
-        }
-
-        if (msg.op === 'directory') {
-          this.connectedPeers = new Set(msg.peers.filter(p => p !== this.peerId));
-          this.onDirectoryChange?.();
-          return;
-        }
-
-        this._receive(msg, slotId);
-      } catch (err) { console.warn('msg inválida', err); }
-    };
-  }
-
-  _broadcastDirectory() {
-    const json = JSON.stringify({
-      op: 'directory',
-      peers: [...this.peerDirectory.keys()]
-    });
-    for (const { dc } of this.slots.values()) {
-      if (dc?.readyState === 'open') dc.send(json);
+    try {
+      const decoded = decodeURIComponent(atob(b64));
+      if (!decoded.startsWith('v=0')) throw new Error('Código não é um SDP válido.');
+      return decoded;
+    } catch (e) {
+      throw new Error('Link corrompido. Copie o link completo novamente.');
     }
-  }
-
-  // ---------- Multi-peer API ----------
-  async createOfferForPeer(slotId) {
-    slotId = slotId || 'peer-' + this._uid().slice(0, 6);
-    const pc = await this._newPC();
-    const dc = pc.createDataChannel('joinslook');
-    this.slots.set(slotId, { pc, dc });
-    this._wireSlot(slotId, dc);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await this._waitIce(pc);
-    return { slotId, sdp: pc.localDescription.sdp };
-  }
-
-  async acceptAnswerForSlot(slotId, answerSdp) {
-    const slot = this.slots.get(slotId);
-    if (!slot) throw new Error('Slot não encontrado: ' + slotId);
-    if (slot.pc.signalingState !== 'have-local-offer') {
-      throw new Error('Slot já conectado ou estado inválido: ' + slot.pc.signalingState);
-    }
-    await slot.pc.setRemoteDescription({
-      type: 'answer',
-      sdp: normalizeSdp(answerSdp)
-    });
-  }
-
-  async acceptOffer(offerSdp) {
-    const slotId = 'host-' + this._uid().slice(0, 6);
-    const pc = await this._newPC();
-    pc.ondatachannel = e => {
-      this.slots.set(slotId, { pc, dc: e.channel });
-      this._wireSlot(slotId, e.channel);
-    };
-    await pc.setRemoteDescription({
-      type: 'offer',
-      sdp: normalizeSdp(offerSdp)
-    });
-    const ans = await pc.createAnswer();
-    await pc.setLocalDescription(ans);
-    await this._waitIce(pc);
-    return { slotId, sdp: pc.localDescription.sdp };
   }
 }
